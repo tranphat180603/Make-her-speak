@@ -1,6 +1,5 @@
 import os
-import sys
-
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +10,39 @@ from torch.utils.data import Dataset, DataLoader
 
 # Set device
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train WaveNet Model")
+    
+    # Dataset parameters
+    parser.add_argument('--files_dir', type=str, required=True, help='Path to the directory containing audio files.')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training.')
+    parser.add_argument('--num_epochs', type=int, default=10, help='Number of training epochs.')
+    parser.add_argument('--sample_rate', type=int, default=22050, help='Sampling rate for audio.')
+    parser.add_argument('--mu', type=int, default=255, help='Mu value for mu-law quantization.')
+    
+    # Model hyperparameters
+    parser.add_argument('--layers', type=int, default=20, help='Number of layers in the model.')
+    parser.add_argument('--stacks', type=int, default=2, help='Number of stacks in the model.')
+    parser.add_argument('--in_channels', type=int, default=256, help='Number of input channels.')
+    parser.add_argument('--res_channels', type=int, default=128, help='Number of residual channels.')
+    parser.add_argument('--gate_channels', type=int, default=128, help='Number of gate channels.')
+    parser.add_argument('--skip_channels', type=int, default=256, help='Number of skip channels.')
+    parser.add_argument('--out_channels', type=int, default=256, help='Number of output channels.')
+    parser.add_argument('--kernel_size', type=int, default=3, help='Kernel size for convolutions.')
+    parser.add_argument('--local_cond_channels', type=int, default=80, help='Number of local condition channels.')
+    parser.add_argument('--upsample_scales', type=int, nargs='+', default=[4, 4], help='Upsample scales for upsampling network.')
+    parser.add_argument('--num_classes', type=int, default=256, help='Number of classes for embedding.')
+    
+    # Optimization parameters
+    parser.add_argument('--learning_rate', type=float, default=1e-3, help='Learning rate for optimizer.')
+    
+    # Miscellaneous
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for DataLoader.')
+    parser.add_argument('--save_model', type=str, default='wavenet_model.pth', help='Path to save the trained model.')
+    
+    args = parser.parse_args()
+    return args
 
 def get_audio_paths(files_dir):
     """
@@ -180,7 +212,7 @@ class Conv1d(nn.Module):
 
 class UpsamplingNetwork(nn.Module):
     """
-    Upsampling network using transposed convolutions.
+    Upsampling network using transposed convolutions for local conditioning.
     """
     def __init__(self, c_in, c_out, upsample_scales):
         super(UpsamplingNetwork, self).__init__()
@@ -257,7 +289,7 @@ class WaveNetModel(nn.Module):
     ):
         super(WaveNetModel, self).__init__()
         
-        
+        # Embedding layer to convert integer inputs to dense vectors
         self.embedding = nn.Embedding(num_classes, in_channels)  # [num_classes, in_channels]
         
         self.start_conv = Conv1d_1x1(in_channels, res_channels)
@@ -301,32 +333,35 @@ class WaveNetModel(nn.Module):
         
         return out
 
-def initialize_model():
+def initialize_model(args):
     """
     Initialize the WaveNet model, loss function, and optimizer.
     
+    Args:
+        args: Parsed command-line arguments.
+        
     Returns:
         tuple: (model, criterion, optimizer, scaler)
     """
     model = WaveNetModel(
-        layers=20, 
-        stacks=2, 
-        in_channels=256,  
-        res_channels=128,  
-        gate_channels=128,
-        skip_channels=256,  
-        out_channels=256, 
-        kernel_size=3, 
-        local_cond_channels=80, 
-        upsample_scales=[4, 4], 
-        num_classes=256
+        layers=args.layers, 
+        stacks=args.stacks, 
+        in_channels=args.in_channels,  
+        res_channels=args.res_channels,  
+        gate_channels=args.gate_channels,
+        skip_channels=args.skip_channels,  
+        out_channels=args.out_channels, 
+        kernel_size=args.kernel_size, 
+        local_cond_channels=args.local_cond_channels, 
+        upsample_scales=args.upsample_scales, 
+        num_classes=args.num_classes
     ).to(DEVICE)
 
     criterion = nn.CrossEntropyLoss()  
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     
     # Mixed precision scaler
-    scaler = torch.GradScaler("cuda") if torch.cuda.is_available() else None
+    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
     
     return model, criterion, optimizer, scaler
 
@@ -352,18 +387,26 @@ def train(model, dataloader, criterion, optimizer, scaler, num_epochs=10):
 
             optimizer.zero_grad()
 
+            # Proper context management
             if scaler:
-                with torch.autocast("cuda"):
+                # Mixed Precision Training
+                with torch.cuda.amp.autocast():
                     outputs = model(inputs1, inputs2)
                     loss = criterion(outputs, targets)
+                
+                # Debugging statements (optional)
+                # print(f"Loss requires grad: {loss.requires_grad}, grad_fn: {loss.grad_fn}")
 
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
             else:
                 # Standard Training
                 outputs = model(inputs1, inputs2)
                 loss = criterion(outputs, targets)
+                
+                # Debugging statements (optional)
+                # print(f"Loss requires grad: {loss.requires_grad}, grad_fn: {loss.grad_fn}")
 
                 loss.backward()
                 optimizer.step()
@@ -379,33 +422,34 @@ def main():
     """
     Main function to execute the training pipeline.
     """
-    # Define parameters
-    files_dir = r'D:\LJSpeech-1.1\LJSpeech-1.1\wavs'
-    batch_size = 4  # Adjust as needed
-    num_epochs = 10
-    sample_rate = 22050
-    mu = 255
+    # Parse command-line arguments
+    args = parse_args()
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using: {device}")
-
+    # Confirm device
+    print(f"Using: {'cuda' if torch.cuda.is_available() else 'cpu'}")
+    
     # Get audio file paths
-    audio_dir = get_audio_paths(files_dir)
+    audio_dir = get_audio_paths(args.files_dir)
     print(f"Found {len(audio_dir)} audio files.")
-
+    
     # Initialize dataset and dataloader
-    dataset = AudioDataset(audio_dir=audio_dir, sample_rate=sample_rate, mu=mu)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=1)
-
+    dataset = AudioDataset(audio_dir=audio_dir, sample_rate=args.sample_rate, mu=args.mu)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=args.num_workers
+    )
+    
     # Initialize model, loss, optimizer, and scaler
-    model, criterion, optimizer, scaler = initialize_model()
-
+    model, criterion, optimizer, scaler = initialize_model(args)
+    
     # Start training
-    train(model, dataloader, criterion, optimizer, scaler, num_epochs=num_epochs)
-
+    train(model, dataloader, criterion, optimizer, scaler, num_epochs=args.num_epochs)
+    
     # Optionally, save the trained model
-    torch.save(model.state_dict(), 'wavenet_model.pth')
-    print("Training complete and model saved.")
+    torch.save(model.state_dict(), args.save_model)
+    print(f"Training complete and model saved to {args.save_model}.")
 
 if __name__ == "__main__":
     main()
